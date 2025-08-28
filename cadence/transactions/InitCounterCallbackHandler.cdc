@@ -1,0 +1,18 @@
+import "CounterCallbackHandler"
+import "FlowCallbackScheduler"
+
+transaction() {
+    prepare(signer: auth(Storage, Capabilities) &Account) {
+        // Save a handler resource to storage if not already present
+        if signer.storage.borrow<&AnyResource>(from: /storage/CounterCallbackHandler) == nil {
+            let handler <- CounterCallbackHandler.createHandler()
+            signer.storage.save(<-handler, to: /storage/CounterCallbackHandler)
+        }
+
+        // Validation/example that we can create an issue a handler capability with correct entitlement for FlowCallbackScheduler (DO NOT COPY, UNLESS THIS IS INTENDED)
+        let _ = signer.capabilities.storage
+            .issue<auth(FlowCallbackScheduler.Execute) &{FlowCallbackScheduler.CallbackHandler}>(/storage/CounterCallbackHandler)
+    }
+}
+
+
