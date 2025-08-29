@@ -30,7 +30,6 @@ access(all) contract Cascade {
     access(all) var status: Status
     access(all) var paymentAmount: UFix64
     access(all) var paymentVaultType: Type
-    access(all) var beneficiary: String
     access(all) var schedule: Schedule
     access(all) var nextPaymentTimestamp: UFix64
 
@@ -41,7 +40,6 @@ access(all) contract Cascade {
       status: Status,
       paymentAmount: UFix64,
       paymentVaultType: Type,
-      beneficiary: String,
       schedule: Schedule,
       nextPaymentTimestamp: UFix64
     ) {
@@ -51,7 +49,29 @@ access(all) contract Cascade {
       self.status = status
       self.paymentAmount = paymentAmount
       self.paymentVaultType = paymentVaultType
-      self.beneficiary = beneficiary
+      self.schedule = schedule
+      self.nextPaymentTimestamp = nextPaymentTimestamp
+    }
+  }
+
+  // Data payload used to auto-register an Agent during callback execution
+  access(all) struct AgentRegistrationData {
+    access(all) let organization: String
+    access(all) let paymentAmount: UFix64
+    access(all) let paymentVaultType: Type
+    access(all) let schedule: Schedule
+    access(all) let nextPaymentTimestamp: UFix64
+
+    init(
+      organization: String,
+      paymentAmount: UFix64,
+      paymentVaultType: Type,
+      schedule: Schedule,
+      nextPaymentTimestamp: UFix64
+    ) {
+      self.organization = organization
+      self.paymentAmount = paymentAmount
+      self.paymentVaultType = paymentVaultType
       self.schedule = schedule
       self.nextPaymentTimestamp = nextPaymentTimestamp
     }
@@ -86,6 +106,7 @@ access(all) contract Cascade {
   access(contract) let agentsByOwner: {Address: AgentOwnerIndex} //index of agents by owner
   access(contract) let agentsByOrganization: {String: OrganizationIndex} //index of agents by organization
   access(contract) var verifiedOrganizations: [String]
+  access(contract) var organizationAddressByName: {String: Address}
 
   access(all) resource Agent: FlowCallbackScheduler.CallbackHandler {
     //All Agent metadata is stored in the AgentDetails struct
@@ -98,8 +119,24 @@ access(all) contract Cascade {
     }
 
     access(FlowCallbackScheduler.Execute) fun executeCallback(id: UInt64, data: AnyStruct?) {
-      pre {
-        Cascade.agentDetailsById[self.agentId] != nil: "Agent not registered"
+      if Cascade.agentDetailsById[self.agentId] == nil {
+        if data != nil {
+          let reg = data as? AgentRegistrationData
+          if reg != nil {
+            self.registerAgent(
+              owner: self.owner?.address ?? panic("Owner not found"),
+              organization: reg!.organization,
+              paymentAmount: reg!.paymentAmount,
+              paymentVaultType: reg!.paymentVaultType,
+              schedule: reg!.schedule,
+              nextPaymentTimestamp: reg!.nextPaymentTimestamp
+            )
+          } else {
+            panic("Invalid data")
+          }
+        } else {
+          panic("No data")
+        }
       }
       panic("stub")
     }
@@ -108,21 +145,21 @@ access(all) contract Cascade {
       pre {
         Cascade.agentDetailsById[self.agentId] != nil: "Agent not registered"
       }
-      panic("stub")
+      Cascade.setAgentStatus(id: self.agentId, status: Status.Paused)
     }
 
     access(all) fun unpause() {
       pre {
         Cascade.agentDetailsById[self.agentId] != nil: "Agent not registered"
       }
-      panic("stub")
+      Cascade.setAgentStatus(id: self.agentId, status: Status.Active)
     }
 
     access(all) fun cancel() {
       pre {
         Cascade.agentDetailsById[self.agentId] != nil: "Agent not registered"
       }
-      panic("stub")
+      Cascade.setAgentStatus(id: self.agentId, status: Status.Canceled)
     }
 
     access(all) fun updatePaymentDetails(newAmount: UFix64?, newSchedule: String?) {
@@ -137,7 +174,6 @@ access(all) contract Cascade {
       organization: String,
       paymentAmount: UFix64,
       paymentVaultType: Type,
-      beneficiary: String,
       schedule: Schedule,
       nextPaymentTimestamp: UFix64
     ) {
@@ -152,7 +188,6 @@ access(all) contract Cascade {
         status: Status.Active,
         paymentAmount: paymentAmount,
         paymentVaultType: paymentVaultType,
-        beneficiary: beneficiary,
         schedule: schedule,
         nextPaymentTimestamp: nextPaymentTimestamp
       )
@@ -176,13 +211,15 @@ access(all) contract Cascade {
   }
 
   access(all) resource CascadeAdmin {
-    access(all) fun addVerifiedOrganization(org: String) {
+    access(all) fun addVerifiedOrganization(org: String, recipient: Address) {
       pre {
         org.length > 0: "organization cannot be empty"
         org.length <= 40: "organization too long"
         Cascade.verifiedOrganizations.contains(org) == false: "organization already verified"
+        Cascade.organizationAddressByName[org] == nil: "organization address already set"
       }
       Cascade.verifiedOrganizations.append(org)
+      Cascade.organizationAddressByName[org] = recipient
     }
   }
 
@@ -190,7 +227,6 @@ access(all) contract Cascade {
     id: UInt64,
     paymentAmount: UFix64,
     paymentVaultType: Type,
-    beneficiary: String,
     organization: String,
     schedule: Schedule,
     nextPaymentTimestamp: UFix64
@@ -206,6 +242,37 @@ access(all) contract Cascade {
     return PublicPath(identifier: "CascadeAgent/".concat(id.toString()))!
   }
 
+  access(contract) fun setAgentStatus(id: UInt64, status: Status) {
+    let existing = Cascade.agentDetailsById[id] ?? panic("Agent not found")
+    Cascade.agentDetailsById[id] = AgentDetails(
+      id: existing.id,
+      owner: existing.owner,
+      organization: existing.organization,
+      status: status,
+      paymentAmount: existing.paymentAmount,
+      paymentVaultType: existing.paymentVaultType,
+      schedule: existing.schedule,
+      nextPaymentTimestamp: existing.nextPaymentTimestamp
+    )
+    emit AgentStatusChanged(id: id, status: status.rawValue)
+  }
+
+  access(all) view fun getAgentDetails(id: UInt64): AgentDetails? {
+    return Cascade.agentDetailsById[id]
+  }
+
+  access(all) view fun getAgentsByOwner(owner: Address): [UInt64]? {
+    return Cascade.agentsByOwner[owner]?.agentIds
+  }
+
+  access(all) view fun getAgentsByOrganization(organization: String): [UInt64]? {
+    return Cascade.agentsByOrganization[organization]?.agentIds
+  }
+
+  access(all) view fun getVerifiedOrganizations(): [String] {
+    return Cascade.verifiedOrganizations
+  }
+
   init() {
     self.CascadeAdminStoragePath = /storage/CascadeAdmin
     self.CascadeAgentStoragePath = /storage/CascadeAgent
@@ -215,6 +282,7 @@ access(all) contract Cascade {
     self.agentsByOwner = {}
     self.agentsByOrganization = {}
     self.verifiedOrganizations = ["AISPORTS"]
+    self.organizationAddressByName = {}
 
     // Save admin resource to contract account and publish capability
     self.account.storage.save(<-create CascadeAdmin(), to: self.CascadeAdminStoragePath)

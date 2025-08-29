@@ -16,7 +16,7 @@ Source of truth: current `cadence/contracts/Cascade.cdc`.
   - `Status { Active, Paused, Canceled }`
   - `Schedule { Daily, Weekly, Monthly, Yearly, OneTime }`
 - Structs:
-  - `AgentDetails` fields: `id`, `owner`, `organization`, `status`, `paymentAmount`, `paymentVaultType`, `beneficiary` (String), `schedule` (Schedule enum), `nextPaymentTimestamp`
+  - `AgentDetails` fields: `id`, `owner`, `organization`, `status`, `paymentAmount`, `paymentVaultType`, `schedule` (Schedule enum), `nextPaymentTimestamp`
   - `AgentOwnerIndex` (owner + [ids]) and `OrganizationIndex` (organization + [ids])
 - Global State (present in code):
   - `nextAgentId: UInt64`
@@ -24,6 +24,7 @@ Source of truth: current `cadence/contracts/Cascade.cdc`.
   - `agentsByOwner: {Address: AgentOwnerIndex}`
   - `agentsByOrganization: {String: OrganizationIndex}`
   - `verifiedOrganizations: [String]` (initialized to `["AISPORTS"]`)
+  - `organizationAddressByName: {String: Address}` (maps organization name → recipient address)
   - Named paths:
     - `CascadeAdminStoragePath: StoragePath`
     - `CascadeAgentStoragePath: StoragePath`
@@ -51,14 +52,15 @@ access(all) resource Agent: FlowCallbackScheduler.CallbackHandler {
   access(all) fun unpause() { /* ... */ }
   access(all) fun cancel() { /* ... */ }
   access(all) fun updatePaymentDetails(newAmount: UFix64?, newSchedule: String?) { /* ... */ }
-  access(contract) fun registerAgent(owner: Address, organization: String, paymentAmount: UFix64, paymentVaultType: Type, beneficiary: String, schedule: Schedule, nextPaymentTimestamp: UFix64) { /* ... */ }
+  access(contract) fun registerAgent(owner: Address, organization: String, paymentAmount: UFix64, paymentVaultType: Type, schedule: Schedule, nextPaymentTimestamp: UFix64) { /* ... */ }
 }
 ```
 
 Notes:
 - There is no separate handler resource. The `Agent` is the callback handler.
 - All payment/schedule/organization details are tracked in `AgentDetails` keyed by the agent id and managed in `agentDetailsById`.
-- All `Agent` methods enforce a precondition that the agent must be registered (`agentDetailsById[agentId] != nil`).
+- `executeCallback` will auto-register the agent if `data` is an `AgentRegistrationData` payload; otherwise it will panic when unregistered.
+- `pause`, `unpause`, `cancel`, and `updatePaymentDetails` require registration.
 
 ---
 
@@ -75,9 +77,11 @@ Notes:
 - View helpers:
   - `isVerifiedOrganization(org: String): Bool`
   - `getVerifiedOrganizations(): [String]`
-  - `getNextAgentId(): UInt64` (returns the next id to use)
   - `getAgentStoragePath(id: UInt64): StoragePath` → `"CascadeAgent/{id}"`
   - `getAgentPublicPath(id: UInt64): PublicPath` → `"CascadeAgent/{id}"`
+  - `getAgentDetails(id: UInt64): AgentDetails?`
+  - `getAgentsByOwner(owner: Address): [UInt64]?`
+  - `getAgentsByOrganization(organization: String): [UInt64]?`
 
 ---
 
@@ -96,6 +100,7 @@ import "FlowToken"
 import "FungibleToken"
 
 transaction(
+  id: UInt64,
   paymentAmount: UFix64,
   paymentVaultType: Type,
   organization: String,
@@ -103,18 +108,16 @@ transaction(
   firstDelaySeconds: UFix64,
   priority: UInt8,
   executionEffort: UInt64,
-  callbackData: AnyStruct?,
   flowFeeWithdrawCap: Capability<auth(FungibleToken.Withdraw) &FlowToken.Vault>?,
   paymentProviderCap: Capability<&{FungibleToken.Provider}>?
 ) {
   prepare(signer: auth(Storage, Capabilities) &Account) {
-    // 1) Determine id and create Agent
-    let agentId = Cascade.getNextAgentId()
+    // 1) Create Agent with provided id
+    let agentId = id
     let agent <- Cascade.createAgent(
       id: agentId,
       paymentAmount: paymentAmount,
       paymentVaultType: paymentVaultType,
-      beneficiary: "", // provided by caller
       organization: organization,
       schedule: schedule,
       nextPaymentTimestamp: getCurrentBlock().timestamp + firstDelaySeconds
@@ -125,8 +128,8 @@ transaction(
     assert(signer.storage.borrow<&Cascade.Agent>(from: storagePath) == nil, message: "agent path occupied")
     signer.storage.save(<-agent, to: storagePath)
 
-    // 3) Register agent details (registerAgent is contract-only and invoked internally)
-    // Registration ensures indices are updated and AgentCreated is emitted
+    // 3) Registration is performed lazily on first callback
+    //    Build AgentRegistrationData as callback data and pass it to the scheduler below
 
     // 4) Estimate and schedule first callback using capability to the stored Agent
     let future = getCurrentBlock().timestamp + firstDelaySeconds
@@ -136,8 +139,16 @@ transaction(
         ? FlowCallbackScheduler.Priority.Medium
         : FlowCallbackScheduler.Priority.Low
 
+    let regData = Cascade.AgentRegistrationData(
+      organization: organization,
+      paymentAmount: paymentAmount,
+      paymentVaultType: paymentVaultType,
+      schedule: schedule,
+      nextPaymentTimestamp: getCurrentBlock().timestamp + firstDelaySeconds
+    )
+
     let est = FlowCallbackScheduler.estimate(
-      data: callbackData,
+      data: regData,
       timestamp: future,
       priority: pr,
       executionEffort: executionEffort
@@ -153,7 +164,7 @@ transaction(
 
     let receipt = FlowCallbackScheduler.schedule(
       callback: agentCap,
-      data: callbackData,
+      data: regData,
       timestamp: future,
       priority: pr,
       executionEffort: executionEffort,
