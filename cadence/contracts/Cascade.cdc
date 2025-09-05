@@ -461,27 +461,7 @@ access(all) contract Cascade {
       nextPaymentTimestamp: nextPaymentTimestamp
     )
   }
-
-  //REMOVE FOR PRODUCTION
-  access(all) fun registerAgentWithRef(
-    agent: &Cascade.Agent,
-    owner: Address,
-    organization: String,
-    paymentAmount: UFix64,
-    paymentVaultType: Type,
-    schedule: Schedule,
-    nextPaymentTimestamp: UFix64
-  ) {
-    agent.registerAgent(
-      owner: owner,
-      organization: organization,
-      paymentAmount: paymentAmount,
-      paymentVaultType: paymentVaultType,
-      schedule: schedule,
-      nextPaymentTimestamp: nextPaymentTimestamp
-    )
-  }
-
+  
   init() {
     self.CascadeAdminStoragePath = /storage/CascadeAdmin
     self.CascadeAgentStoragePath = /storage/CascadeAgent
