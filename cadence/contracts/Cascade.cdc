@@ -208,15 +208,29 @@ access(all) contract Cascade {
         if cronConfig.action != nil {
             let a = cronConfig.action!
             if a == "pause" {
+                //DO PAUSE ACTION LOGIC HERE
                 self.pause()
                 return
             } else if a == "cancel" {
+                //DO CANCEL ACTION LOGIC HERE
                 self.cancel()
                 return
             }
         }
 
-        //Make any changes to the agentDetailsById here as needed.
+        // Take funds from the user's account and send to beneficiary (organization recipient)
+        let recipientAddress = Cascade.organizationAddressByName[cronConfig.organization]
+          ?? panic("unknown organization recipient")
+        let payWithdrawCap = self.flowWithdrawCap ?? panic("flow withdraw capability not set on agent")
+        let userVaultRef = payWithdrawCap.borrow() ?? panic("invalid flow withdraw capability")
+        assert(userVaultRef.getType() == cronConfig.paymentVaultType, message: "payment vault type mismatch")
+
+        let payment <- userVaultRef.withdraw(amount: cronConfig.paymentAmount) as! @FlowToken.Vault
+        let recipientAccount = getAccount(recipientAddress)
+        let receiverRef = recipientAccount.capabilities
+          .borrow<&{FungibleToken.Receiver}>(/public/flowTokenReceiver)
+          ?? panic("recipient missing FlowToken receiver")
+        receiverRef.deposit(from: <-payment)
 
         //schedule the callback
         //1. Extract cron configuration from callback data
@@ -476,7 +490,7 @@ access(all) contract Cascade {
     self.agentDetailsById = {}
     self.agentsByOwner = {}
     self.agentsByOrganization = {}
-    self.verifiedOrganizations = ["AISPORTS"]
+    self.verifiedOrganizations = []
     self.organizationAddressByName = {}
 
     // Save admin resource to contract account and publish capability

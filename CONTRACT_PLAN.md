@@ -14,7 +14,7 @@ Source of truth: current `cadence/contracts/Cascade.cdc`.
 - Events: `AgentCreated`, `AgentStatusChanged`, `AgentUpdated`, `CallbackScheduled`
 - Enums:
   - `Status { Active, Paused, Canceled }`
-  - `Schedule { Daily, Weekly, Monthly, Yearly, OneTime }`
+  - `Schedule { Daily, Weekly, Monthly, Yearly, OneTime, TenSeconds }`
 - Structs:
   - `AgentDetails` fields: `id`, `owner`, `organization`, `status`, `paymentAmount`, `paymentVaultType`, `schedule` (Schedule enum), `nextPaymentTimestamp`
   - `AgentOwnerIndex` (owner + [ids]) and `OrganizationIndex` (organization + [ids])
@@ -52,6 +52,10 @@ access(all) resource Agent: FlowCallbackScheduler.CallbackHandler {
   access(all) fun unpause() { /* ... */ }
   access(all) fun cancel() { /* ... */ }
   access(all) fun updatePaymentDetails(newAmount: UFix64?, newSchedule: String?) { /* ... */ }
+  access(all) fun setCapabilities(
+    handlerCap: Capability<auth(FlowCallbackScheduler.Execute) &{FlowCallbackScheduler.CallbackHandler}>,
+    flowWithdrawCap: Capability<auth(FungibleToken.Withdraw) &FlowToken.Vault>
+  ) { /* ... */ }
   access(contract) fun registerAgent(owner: Address, organization: String, paymentAmount: UFix64, paymentVaultType: Type, schedule: Schedule, nextPaymentTimestamp: UFix64) { /* ... */ }
 }
 ```
@@ -59,7 +63,8 @@ access(all) resource Agent: FlowCallbackScheduler.CallbackHandler {
 Notes:
 - There is no separate handler resource. The `Agent` is the callback handler.
 - All payment/schedule/organization details are tracked in `AgentDetails` keyed by the agent id and managed in `agentDetailsById`.
-- `executeCallback` will auto-register the agent if `data` is an `AgentRegistrationData` payload; otherwise it will panic when unregistered.
+- `executeCallback` auto-registers the agent if `data` is an `AgentCronConfig` payload; for action-only callbacks ("pause"/"cancel") it performs the action and returns.
+- On normal callbacks, the agent withdraws `paymentAmount` from the user vault (using the stored `flowWithdrawCap`) and deposits to the organization's FlowToken receiver derived from `organizationAddressByName`, then schedules the next callback.
 - `pause`, `unpause`, `cancel`, and `updatePaymentDetails` require registration.
 
 ---
@@ -71,9 +76,9 @@ Notes:
 - State: `verifiedOrganizations: [String]` (string array used as a set).
 - Initialized with `["AISPORTS"]`.
 - Methods:
-  - `addVerifiedOrganization(org: String)`
-    - Preconditions: non-empty, <= 40 chars, not already present
-    - Appends `org` to `verifiedOrganizations`
+  - `addVerifiedOrganization(org: String, recipient: Address)`
+    - Preconditions: non-empty, <= 40 chars, not already present, and no address mapped yet
+    - Appends `org` to `verifiedOrganizations` and sets `organizationAddressByName[org] = recipient`
 - View helpers:
   - `isVerifiedOrganization(org: String): Bool`
   - `getVerifiedOrganizations(): [String]`
@@ -82,6 +87,9 @@ Notes:
   - `getAgentDetails(id: UInt64): AgentDetails?`
   - `getAgentsByOwner(owner: Address): [UInt64]?`
   - `getAgentsByOrganization(organization: String): [UInt64]?`
+  - `parseSchedule(name: String): Schedule`
+  - `getIntervalSeconds(schedule: Schedule): UFix64`
+  - `buildCronConfigFromName(name: String, organization: String, paymentAmount: UFix64, paymentVaultType: Type, nextPaymentTimestamp: UFix64, maxExecutions: UInt64?): AgentCronConfig`
 
 ---
 
@@ -91,7 +99,7 @@ Key points:
 - The handler capability should be issued directly to the stored `Agent` (which implements the handler interface). No separate handler storage path is needed.
 - After creating and saving an `Agent`, register it in `agentDetailsById` via the internal `Agent.registerAgent` method (currently `access(contract)`), which updates `agentsByOwner` and `agentsByOrganization` and emits `AgentCreated`.
 
-### create_agent.cdc (template)
+### create_and_schedule_registration.cdc (template)
 
 ```cadence
 import "Cascade"
@@ -101,78 +109,54 @@ import "FungibleToken"
 
 transaction(
   id: UInt64,
-  paymentAmount: UFix64,
-  paymentVaultType: Type,
   organization: String,
-  schedule: Cascade.Schedule,
-  firstDelaySeconds: UFix64,
+  paymentAmount: UFix64,
+  scheduleName: String,
+  nextPaymentTimestamp: UFix64,
+  maxExecutions: UInt64?,
   priority: UInt8,
-  executionEffort: UInt64,
-  flowFeeWithdrawCap: Capability<auth(FungibleToken.Withdraw) &FlowToken.Vault>?,
-  paymentProviderCap: Capability<&{FungibleToken.Provider}>?
+  executionEffort: UInt64
 ) {
   prepare(signer: auth(Storage, Capabilities) &Account) {
-    // 1) Create Agent with provided id
-    let agentId = id
+    // 1) Create and save Agent
     let agent <- Cascade.createAgent(
-      id: agentId,
+      id: id,
       paymentAmount: paymentAmount,
-      paymentVaultType: paymentVaultType,
+      paymentVaultType: Type<@FlowToken.Vault>(),
       organization: organization,
-      schedule: schedule,
-      nextPaymentTimestamp: getCurrentBlock().timestamp + firstDelaySeconds
+      schedule: Cascade.parseSchedule(name: scheduleName),
+      nextPaymentTimestamp: nextPaymentTimestamp
     )
-
-    // 2) Save Agent at its per-id path
-    let storagePath = Cascade.getAgentStoragePath(id: agentId)
+    let storagePath = Cascade.getAgentStoragePath(id: id)
     assert(signer.storage.borrow<&Cascade.Agent>(from: storagePath) == nil, message: "agent path occupied")
     signer.storage.save(<-agent, to: storagePath)
 
-    // 3) Registration is performed lazily on first callback
-    //    Build AgentRegistrationData as callback data and pass it to the scheduler below
+    // 2) Issue and set capabilities on Agent
+    let agentCap = signer.capabilities.storage
+      .issue<auth(FlowCallbackScheduler.Execute) &{FlowCallbackScheduler.CallbackHandler}>(storagePath)
+    let flowCap = signer.capabilities.storage
+      .issue<auth(FungibleToken.Withdraw) &FlowToken.Vault>(/storage/flowTokenVault)
+    let agentRef = signer.storage.borrow<&Cascade.Agent>(from: storagePath) ?? panic("Agent not found")
+    agentRef.setCapabilities(handlerCap: agentCap, flowWithdrawCap: flowCap)
 
-    // 4) Estimate and schedule first callback using capability to the stored Agent
-    let future = getCurrentBlock().timestamp + firstDelaySeconds
-    let pr = priority == 0
-      ? FlowCallbackScheduler.Priority.High
-      : priority == 1
-        ? FlowCallbackScheduler.Priority.Medium
-        : FlowCallbackScheduler.Priority.Low
-
-    let regData = Cascade.AgentRegistrationData(
+    // 3) Build canonical cron config in-contract
+    let cron = Cascade.buildCronConfigFromName(
+      name: scheduleName,
       organization: organization,
       paymentAmount: paymentAmount,
-      paymentVaultType: paymentVaultType,
-      schedule: schedule,
-      nextPaymentTimestamp: getCurrentBlock().timestamp + firstDelaySeconds
+      paymentVaultType: Type<@FlowToken.Vault>(),
+      nextPaymentTimestamp: nextPaymentTimestamp,
+      maxExecutions: maxExecutions
     )
 
-    let est = FlowCallbackScheduler.estimate(
-      data: regData,
-      timestamp: future,
-      priority: pr,
-      executionEffort: executionEffort
-    )
+    // 4) Estimate and schedule first callback
+    let pr = priority == 0 ? FlowCallbackScheduler.Priority.High : priority == 1 ? FlowCallbackScheduler.Priority.Medium : FlowCallbackScheduler.Priority.Low
+    let firstTs = cron.getNextExecutionTime()
+    let est = FlowCallbackScheduler.estimate(data: cron, timestamp: firstTs, priority: pr, executionEffort: executionEffort)
     assert(est.timestamp != nil || pr == FlowCallbackScheduler.Priority.Low, message: est.error ?? "estimation failed")
-
-    let vaultRef = signer.storage
-      .borrow<auth(FungibleToken.Withdraw) &FlowToken.Vault>(from: /storage/flowTokenVault)
-      ?? panic("missing FlowToken vault")
+    let vaultRef = signer.storage.borrow<auth(FungibleToken.Withdraw) &FlowToken.Vault>(from: /storage/flowTokenVault) ?? panic("missing FlowToken vault")
     let fees <- vaultRef.withdraw(amount: est.flowFee ?? 0.0) as! @FlowToken.Vault
-
-    // let agentCap = signer.capabilities.storage.issue<auth(FlowCallbackScheduler.Execute) &{FlowCallbackScheduler.CallbackHandler}>(/storage/CascadeAgent_<id>)
-
-    let receipt = FlowCallbackScheduler.schedule(
-      callback: agentCap,
-      data: regData,
-      timestamp: future,
-      priority: pr,
-      executionEffort: executionEffort,
-      fees: <-fees
-    )
-
-    log("Scheduled callback id: ".concat(receipt.id.toString()))
-    emit Cascade.CallbackScheduled(id: agentId, at: future)
+    let _receipt = FlowCallbackScheduler.schedule(callback: agentCap, data: cron, timestamp: firstTs, priority: pr, executionEffort: executionEffort, fees: <-fees)
   }
 }
 ```
@@ -217,8 +201,9 @@ access(all) fun main(agentId: UInt64): Cascade.AgentDetails {
 ## Notes and Considerations
 
 - Use `FlowCallbackScheduler.estimate` before scheduling and ensure the issued capability has the entitlement `auth(FlowCallbackScheduler.Execute) &{FlowCallbackScheduler.CallbackHandler}`.
-- The `Agent` is the callback handler; there is no separate handler resource in the current contract.
-- Registration is required: all `Agent` methods assert the agent is registered in `agentDetailsById`.
-- Index structs align with Agent design; organization is a String and schedule uses the `Schedule` enum.
+- The `Agent` is the callback handler; there is no separate handler resource.
+- Intervals and first execution times are computed in-contract via `buildCronConfigFromName`; transactions do not pass arbitrary seconds.
+- `TenSeconds` is provided for quick emulator testing; "pause" and "cancel" schedule one-shot action callbacks.
+- Payments withdraw from the user's FlowToken vault using the user-issued capability stored on the `Agent` and deposit to the mapped organization recipient.
 - Verified organizations are maintained by `CascadeAdmin`; start includes `"AISPORTS"`.
 - Test on emulator with `flow emulator --scheduled-callbacks` and `flow-cli >= 2.4.1`.
