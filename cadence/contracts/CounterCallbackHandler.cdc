@@ -17,5 +17,3 @@ access(all) contract CounterCallbackHandler {
         return <- create Handler()
     }
 }
-
-

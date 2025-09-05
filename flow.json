@@ -1,5 +1,11 @@
 {
 	"contracts": {
+		"Cascade": {
+			"source": "cadence/contracts/Cascade.cdc",
+			"aliases": {
+				"testing": "0000000000000007"
+			}
+		},
 		"Counter": {
 			"source": "cadence/contracts/Counter.cdc",
 			"aliases": {
@@ -143,7 +149,8 @@
 				"RickRoll",
 				"CounterCallbackHandler",
 				"CounterLoopCallbackHandler",
-				"CounterCronCallbackHandler"
+				"CounterCronCallbackHandler",
+				"Cascade"
 			]
 		}
 	}

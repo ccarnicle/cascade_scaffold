@@ -1,6 +1,8 @@
-# 👋 Welcome to the Scheduled Callbacks Scaffold
+# 👋 Welcome to the Flow Agent Procol
 
-This project is a starting point for you to test out Scheduled Callbacks on the Flow Blockchain. It comes with example contracts, scripts, transactions, and tests to help you get started.
+This project is a starting point for a platfom to build autonomous flow agents. Flow agents live in a users account and use schedulued callbacks to wake on a timer and perform DeFi actions in that users account.
+
+This project is a WIP - the current plan can be found in the PROJECT_PLAN.md file
 
 ## What are Scheduled Callbacks?
 
