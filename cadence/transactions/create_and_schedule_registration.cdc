@@ -64,7 +64,7 @@ transaction(
     agentRef.setCapabilities(handlerCap: agentCap, flowWithdrawCap: flowCap)
 
     // Build cron configuration payload in-contract (standardized intervals)
-    let cronConfig = Cascade.buildCronConfigFromName(
+    let cronConfig: Cascade.AgentCronConfig = Cascade.buildCronConfigFromName(
       name: scheduleName,
       organization: organization,
       paymentAmount: paymentAmount,
@@ -73,8 +73,8 @@ transaction(
       maxExecutions: maxExecutions
     )
 
-    // Compute first execution time using config helper
-    let firstExecutionTime = cronConfig.getNextExecutionTime()
+    // Compute first execution time: as-soon-as-possible (next block)
+    let firstExecutionTime: UFix64 = getCurrentBlock().timestamp + 1.0
 
     // Priority mapping
     let pr = priority == 0

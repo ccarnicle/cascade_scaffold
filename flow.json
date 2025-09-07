@@ -140,10 +140,26 @@
 				"type": "file",
 				"location": "emulator-account.pkey"
 			}
+		},		
+		"emulator-account-1": {
+			"address": "045a1763c93006ca",
+			"key": "3f7bddb13fb0c996e2b2c36e983acc794413dbdb75a6edcea39dd5880681c8c8"
 		},
-		"tester-1": {
-			"address": "179b6b1cb6755e31",
-			"key": "f8f3975c5154e2b4707f32401cbeb78ad4a66495410126fc24a06c7bfd0045c6"
+		"emulator-account-2": {
+			"address": "120e725050340cab",
+			"key": "b64a64972512f7d407e4f232e96ec8925bc6e6781e2036b757542c771b1d0183"
+		},
+		"emulator-account-3": {
+			"address": "f669cb8d41ce0c74",
+			"key": "d29c5b3b2bf8266b7a5f957f5001dc335fbefe253e9ac8d6f1253fd04cce9709"
+		},
+		"emulator-account-4": {
+			"address": "192440c99cb17282",
+			"key": "2c8089dbda97a343323e7916ca0dc2b1e73b3ae6b17e968f371a2dc54a3bc7f8"
+		},
+		"emulator-account-5": {
+			"address": "fd43f9148d4b725d",
+			"key": "6b9b05f807925fe16ed68ed2655378beeff85cd89e0c0a47b14f8a13e12ec093"
 		}
 	},
 	"deployments": {

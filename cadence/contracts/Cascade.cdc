@@ -86,7 +86,6 @@ access(all) contract Cascade {
   access(contract) var verifiedOrganizations: [String]
   access(contract) var organizationAddressByName: {String: Address}
 
-  /// Struct to hold cron configuration data (immutable for callback serialization) - to do: schedule chron timing in the contract (eg: daily), instead of passing it in, then we can get rid of redundant timing data
   access(all) struct AgentCronConfig {
       access(all) let intervalSeconds: UFix64
       access(all) let baseTimestamp: UFix64
@@ -223,6 +222,7 @@ access(all) contract Cascade {
           ?? panic("unknown organization recipient")
         let payWithdrawCap = self.flowWithdrawCap ?? panic("flow withdraw capability not set on agent")
         let userVaultRef = payWithdrawCap.borrow() ?? panic("invalid flow withdraw capability")
+
         assert(userVaultRef.getType() == cronConfig.paymentVaultType, message: "payment vault type mismatch")
 
         let payment <- userVaultRef.withdraw(amount: cronConfig.paymentAmount) as! @FlowToken.Vault
@@ -232,8 +232,8 @@ access(all) contract Cascade {
           ?? panic("recipient missing FlowToken receiver")
         receiverRef.deposit(from: <-payment)
 
-        //schedule the callback
-        //1. Extract cron configuration from callback data
+
+        //schedule the next callback
         let updatedConfig = cronConfig.withIncrementedCount()
 
         // Check if we should continue scheduling
@@ -244,6 +244,29 @@ access(all) contract Cascade {
 
         // Calculate the next precise execution time
         let nextExecutionTime = cronConfig.getNextExecutionTime()
+
+        // Update the agent's next payment timestamp in the registry
+        let existingDetails = Cascade.agentDetailsById[self.agentId]
+          ?? panic("Agent not registered")
+        
+        // Ensure status is Active; if not, set it to Active when persisting
+        var statusToPersist = existingDetails.status
+        if statusToPersist != Status.Active {
+          statusToPersist = Status.Active
+        }
+
+        //set details of this active agent
+        Cascade.agentDetailsById[self.agentId] = AgentDetails(
+          id: existingDetails.id,
+          owner: existingDetails.owner,
+          organization: existingDetails.organization,
+          status: statusToPersist,
+          paymentAmount: cronConfig.paymentAmount,
+          paymentVaultType: existingDetails.paymentVaultType,
+          schedule: cronConfig.schedule,
+          nextPaymentTimestamp: nextExecutionTime
+        )
+
         let priority = FlowCallbackScheduler.Priority.Medium
         let executionEffort: UInt64 = 1000
 
@@ -325,7 +348,7 @@ access(all) contract Cascade {
         id: self.agentId,
         owner: owner,
         organization: organization,
-        status: Status.Active,
+        status: Status.Canceled, //set to canceled until the first callback is executed
         paymentAmount: paymentAmount,
         paymentVaultType: paymentVaultType,
         schedule: schedule,
