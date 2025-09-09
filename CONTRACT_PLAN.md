@@ -23,7 +23,7 @@ Source of truth: current `cadence/contracts/Cascade.cdc`.
   - `agentDetailsById: {UInt64: AgentDetails}`
   - `agentsByOwner: {Address: AgentOwnerIndex}`
   - `agentsByOrganization: {String: OrganizationIndex}`
-  - `verifiedOrganizations: [String]` (initialized to `["AISPORTS"]`)
+  - `verifiedOrganizations: [String]` (initialized to empty `[]`)
   - `organizationAddressByName: {String: Address}` (maps organization name → recipient address)
   - Named paths:
     - `CascadeAdminStoragePath: StoragePath`
@@ -66,6 +66,7 @@ Notes:
 - `executeCallback` auto-registers the agent if `data` is an `AgentCronConfig` payload; for action-only callbacks ("pause"/"cancel") it performs the action and returns.
 - On normal callbacks, the agent withdraws `paymentAmount` from the user vault (using the stored `flowWithdrawCap`) and deposits to the organization's FlowToken receiver derived from `organizationAddressByName`, then schedules the next callback.
 - `pause`, `unpause`, `cancel`, and `updatePaymentDetails` require registration.
+- `updatePaymentDetails` is currently a stub (panics). Avoid using the "update" action until implemented.
 
 ---
 
@@ -74,13 +75,12 @@ Notes:
 - `CascadeAdmin` is stored in the contract account at `CascadeAdminStoragePath`.
 - Purpose: manage a verified organization list.
 - State: `verifiedOrganizations: [String]` (string array used as a set).
-- Initialized with `["AISPORTS"]`.
+- Initialized as empty `[]`.
 - Methods:
   - `addVerifiedOrganization(org: String, recipient: Address)`
     - Preconditions: non-empty, <= 40 chars, not already present, and no address mapped yet
     - Appends `org` to `verifiedOrganizations` and sets `organizationAddressByName[org] = recipient`
 - View helpers:
-  - `isVerifiedOrganization(org: String): Bool`
   - `getVerifiedOrganizations(): [String]`
   - `getAgentStoragePath(id: UInt64): StoragePath` → `"CascadeAgent/{id}"`
   - `getAgentPublicPath(id: UInt64): PublicPath` → `"CascadeAgent/{id}"`
@@ -97,7 +97,7 @@ Notes:
 
 Key points:
 - The handler capability should be issued directly to the stored `Agent` (which implements the handler interface). No separate handler storage path is needed.
-- After creating and saving an `Agent`, register it in `agentDetailsById` via the internal `Agent.registerAgent` method (currently `access(contract)`), which updates `agentsByOwner` and `agentsByOrganization` and emits `AgentCreated`.
+- Registration is performed automatically by `Agent.executeCallback` on the first scheduled run using the provided `AgentCronConfig`. Transactions do not call `registerAgent` directly.
 
 ### create_and_schedule_registration.cdc (template)
 
@@ -140,7 +140,7 @@ transaction(
     agentRef.setCapabilities(handlerCap: agentCap, flowWithdrawCap: flowCap)
 
     // 3) Build canonical cron config in-contract
-    let cron = Cascade.buildCronConfigFromName(
+    let cronConfig: Cascade.AgentCronConfig = Cascade.buildCronConfigFromName(
       name: scheduleName,
       organization: organization,
       paymentAmount: paymentAmount,
@@ -149,14 +149,14 @@ transaction(
       maxExecutions: maxExecutions
     )
 
-    // 4) Estimate and schedule first callback
+    // 4) Estimate and schedule first callback (next block)
     let pr = priority == 0 ? FlowCallbackScheduler.Priority.High : priority == 1 ? FlowCallbackScheduler.Priority.Medium : FlowCallbackScheduler.Priority.Low
-    let firstTs = cron.getNextExecutionTime()
-    let est = FlowCallbackScheduler.estimate(data: cron, timestamp: firstTs, priority: pr, executionEffort: executionEffort)
+    let firstExecutionTime: UFix64 = getCurrentBlock().timestamp + 1.0
+    let est = FlowCallbackScheduler.estimate(data: cronConfig, timestamp: firstExecutionTime, priority: pr, executionEffort: executionEffort)
     assert(est.timestamp != nil || pr == FlowCallbackScheduler.Priority.Low, message: est.error ?? "estimation failed")
     let vaultRef = signer.storage.borrow<auth(FungibleToken.Withdraw) &FlowToken.Vault>(from: /storage/flowTokenVault) ?? panic("missing FlowToken vault")
     let fees <- vaultRef.withdraw(amount: est.flowFee ?? 0.0) as! @FlowToken.Vault
-    let _receipt = FlowCallbackScheduler.schedule(callback: agentCap, data: cron, timestamp: firstTs, priority: pr, executionEffort: executionEffort, fees: <-fees)
+    let _receipt = FlowCallbackScheduler.schedule(callback: agentCap, data: cronConfig, timestamp: firstExecutionTime, priority: pr, executionEffort: executionEffort, fees: <-fees)
   }
 }
 ```
@@ -192,7 +192,7 @@ transaction(agentPath: StoragePath, action: String, newAmount: UFix64?, newSched
 import "Cascade"
 
 access(all) fun main(agentId: UInt64): Cascade.AgentDetails {
-  return Cascade.agentDetailsById[agentId] ?? panic("Agent not found")
+  return Cascade.getAgentDetails(id: agentId) ?? panic("Agent not found")
 }
 ```
 
@@ -202,8 +202,8 @@ access(all) fun main(agentId: UInt64): Cascade.AgentDetails {
 
 - Use `FlowCallbackScheduler.estimate` before scheduling and ensure the issued capability has the entitlement `auth(FlowCallbackScheduler.Execute) &{FlowCallbackScheduler.CallbackHandler}`.
 - The `Agent` is the callback handler; there is no separate handler resource.
-- Intervals and first execution times are computed in-contract via `buildCronConfigFromName`; transactions do not pass arbitrary seconds.
+- Intervals are computed in-contract via `buildCronConfigFromName`; the first execution is scheduled for the next block using `getCurrentBlock().timestamp + 1.0` in the transaction template.
 - `TenSeconds` is provided for quick emulator testing; "pause" and "cancel" schedule one-shot action callbacks.
 - Payments withdraw from the user's FlowToken vault using the user-issued capability stored on the `Agent` and deposit to the mapped organization recipient.
-- Verified organizations are maintained by `CascadeAdmin`; start includes `"AISPORTS"`.
+- Verified organizations are maintained by `CascadeAdmin`; the list starts empty and can be populated via the admin transaction (e.g., `add_organization.cdc`).
 - Test on emulator with `flow emulator --scheduled-callbacks` and `flow-cli >= 2.4.1`.
