@@ -24,6 +24,12 @@ access(all) contract Cascade {
     access(all) case TenSeconds
   }
 
+  // Agent action type: determines what work the agent does on execution
+  access(all) enum Action: UInt8 {
+    access(all) case Send
+    access(all) case Swap
+  }
+
   access(all) struct AgentDetails {
     access(all) let id: UInt64
     access(all) let owner: Address
@@ -33,6 +39,7 @@ access(all) contract Cascade {
     access(all) var paymentVaultType: Type
     access(all) var schedule: Schedule
     access(all) var nextPaymentTimestamp: UFix64
+    access(all) var action: Action
 
     init(
       id: UInt64,
@@ -42,7 +49,8 @@ access(all) contract Cascade {
       paymentAmount: UFix64,
       paymentVaultType: Type,
       schedule: Schedule,
-      nextPaymentTimestamp: UFix64
+      nextPaymentTimestamp: UFix64,
+      action: Action
     ) {
       self.id = id
       self.owner = owner
@@ -52,6 +60,7 @@ access(all) contract Cascade {
       self.paymentVaultType = paymentVaultType
       self.schedule = schedule
       self.nextPaymentTimestamp = nextPaymentTimestamp
+      self.action = action
     }
   }
 
@@ -167,6 +176,7 @@ access(all) contract Cascade {
     access(all) let agentId: UInt64
     access(contract) var handlerCap: Capability<auth(FlowCallbackScheduler.Execute) &{FlowCallbackScheduler.CallbackHandler}>?
     access(contract) var flowWithdrawCap: Capability<auth(FungibleToken.Withdraw) &FlowToken.Vault>?
+    access(contract) var lastCallback: FlowCallbackScheduler.ScheduledCallback?
 
     init(
       id: UInt64
@@ -174,6 +184,7 @@ access(all) contract Cascade {
       self.agentId = id
       self.handlerCap = nil
       self.flowWithdrawCap = nil
+      self.lastCallback = nil
     }
 
     access(all) fun setCapabilities(
@@ -202,35 +213,41 @@ access(all) contract Cascade {
             panic("Invalid data")
           }
         }
-        // Handle action-only callbacks (pause/cancel)
-        let cronConfig = data as! AgentCronConfig? ?? panic("CounterCronConfig data is required")
-        if cronConfig.action != nil {
-            let a = cronConfig.action!
-            if a == "pause" {
-                //DO PAUSE ACTION LOGIC HERE
-                self.pause()
-                return
-            } else if a == "cancel" {
-                //DO CANCEL ACTION LOGIC HERE
-                self.cancel()
-                return
-            }
+        // Parse cron data for timing/registration only
+        let cronConfig = data as! AgentCronConfig? ?? panic("AgentCronConfig data is required")
+        
+        // If the agent is paused and not yet at the resume time, skip execution
+        let currentDetails = Cascade.agentDetailsById[self.agentId] ?? panic("Agent not registered")
+        if currentDetails.status == Status.Canceled {
+          return
+        }
+        if currentDetails.status == Status.Paused {
+          let now = getCurrentBlock().timestamp
+          if now < currentDetails.nextPaymentTimestamp {
+            return
+          }
+          Cascade.setAgentStatus(id: self.agentId, status: Status.Active)
         }
 
-        // Take funds from the user's account and send to beneficiary (organization recipient)
-        let recipientAddress = Cascade.organizationAddressByName[cronConfig.organization]
-          ?? panic("unknown organization recipient")
-        let payWithdrawCap = self.flowWithdrawCap ?? panic("flow withdraw capability not set on agent")
-        let userVaultRef = payWithdrawCap.borrow() ?? panic("invalid flow withdraw capability")
+        // Dispatch by action
+        if currentDetails.action == Action.Send {  //this deposits the funds from the user's account to the organization's account - we will change this to swapping for in the future
 
-        assert(userVaultRef.getType() == cronConfig.paymentVaultType, message: "payment vault type mismatch")
+          let recipientAddress = Cascade.organizationAddressByName[currentDetails.organization]
+            ?? panic("unknown organization recipient")
+          let payWithdrawCap = self.flowWithdrawCap ?? panic("flow withdraw capability not set on agent")
+          let userVaultRef = payWithdrawCap.borrow() ?? panic("invalid flow withdraw capability")
 
-        let payment <- userVaultRef.withdraw(amount: cronConfig.paymentAmount) as! @FlowToken.Vault
-        let recipientAccount = getAccount(recipientAddress)
-        let receiverRef = recipientAccount.capabilities
-          .borrow<&{FungibleToken.Receiver}>(/public/flowTokenReceiver)
-          ?? panic("recipient missing FlowToken receiver")
-        receiverRef.deposit(from: <-payment)
+          assert(userVaultRef.getType() == currentDetails.paymentVaultType, message: "payment vault type mismatch")
+
+          let payment <- userVaultRef.withdraw(amount: currentDetails.paymentAmount) as! @FlowToken.Vault
+          let recipientAccount = getAccount(recipientAddress)
+          let receiverRef = recipientAccount.capabilities
+            .borrow<&{FungibleToken.Receiver}>(/public/flowTokenReceiver)
+            ?? panic("recipient missing FlowToken receiver")
+          receiverRef.deposit(from: <-payment)
+        } else if currentDetails.action == Action.Swap {
+          panic("Swap action not implemented yet")
+        }
 
 
         //schedule the next callback
@@ -242,29 +259,27 @@ access(all) contract Cascade {
             return
         }
 
-        // Calculate the next precise execution time
-        let nextExecutionTime = cronConfig.getNextExecutionTime()
-
-        // Update the agent's next payment timestamp in the registry
-        let existingDetails = Cascade.agentDetailsById[self.agentId]
-          ?? panic("Agent not registered")
-        
-        // Ensure status is Active; if not, set it to Active when persisting
-        var statusToPersist = existingDetails.status
-        if statusToPersist != Status.Active {
-          statusToPersist = Status.Active
+        // Calculate the next precise execution time using current schedule
+        let intervalSeconds = Cascade.getIntervalSeconds(schedule: currentDetails.schedule)
+        let nowTs = getCurrentBlock().timestamp
+        var nextExecutionTime: UFix64 = nowTs + 1.0
+        if intervalSeconds > 0.0 {
+          // align based on last recorded nextPaymentTimestamp if in the future, else now
+          let base = currentDetails.nextPaymentTimestamp > nowTs ? currentDetails.nextPaymentTimestamp : nowTs
+          nextExecutionTime = UFix64(UInt64(base + intervalSeconds))
         }
 
-        //set details of this active agent
+        // Persist next execution and active status using currentDetails snapshot
         Cascade.agentDetailsById[self.agentId] = AgentDetails(
-          id: existingDetails.id,
-          owner: existingDetails.owner,
-          organization: existingDetails.organization,
-          status: statusToPersist,
-          paymentAmount: cronConfig.paymentAmount,
-          paymentVaultType: existingDetails.paymentVaultType,
-          schedule: cronConfig.schedule,
-          nextPaymentTimestamp: nextExecutionTime
+          id: currentDetails.id,
+          owner: currentDetails.owner,
+          organization: currentDetails.organization,
+          status: Status.Active,
+          paymentAmount: currentDetails.paymentAmount,
+          paymentVaultType: currentDetails.paymentVaultType,
+          schedule: currentDetails.schedule,
+          nextPaymentTimestamp: nextExecutionTime,
+          action: currentDetails.action
         )
 
         let priority = FlowCallbackScheduler.Priority.Medium
@@ -299,38 +314,259 @@ access(all) contract Cascade {
         )
 
         emit CallbackScheduled(id: self.agentId, at: receipt.timestamp)
+        self.lastCallback = receipt
       } else {
         panic("No data provided")
       }
     }
 
-    access(all) fun pause() {
+    access(all) fun pauseUntil(resumeTimestamp: UFix64) {
       pre {
         Cascade.agentDetailsById[self.agentId] != nil: "Agent not registered"
       }
-      Cascade.setAgentStatus(id: self.agentId, status: Status.Paused)
-    }
+      let existing = Cascade.agentDetailsById[self.agentId] ?? panic("Agent not registered")
+      let now = getCurrentBlock().timestamp
+      let resumeAt: UFix64 = resumeTimestamp
+      assert(resumeAt > now, message: "resume timestamp must be in the future")
 
-    access(all) fun unpause() {
-      pre {
-        Cascade.agentDetailsById[self.agentId] != nil: "Agent not registered"
-      }
-      Cascade.setAgentStatus(id: self.agentId, status: Status.Active)
+      // Update registry to paused and record resume time
+      Cascade.agentDetailsById[self.agentId] = AgentDetails(
+        id: existing.id,
+        owner: existing.owner,
+        organization: existing.organization,
+        status: Status.Paused,
+        paymentAmount: existing.paymentAmount,
+        paymentVaultType: existing.paymentVaultType,
+        schedule: existing.schedule,
+        nextPaymentTimestamp: resumeAt,
+        action: existing.action
+      )
+      emit AgentStatusChanged(id: self.agentId, status: Status.Paused.rawValue)
+
+      // Build a config for resuming normal execution
+      let interval = Cascade.getIntervalSeconds(schedule: existing.schedule)
+      let resumeConfig = AgentCronConfig(
+        intervalSeconds: interval,
+        baseTimestamp: now,
+        maxExecutions: nil,
+        executionCount: 0,
+        action: nil,
+        organization: existing.organization,
+        paymentAmount: existing.paymentAmount,
+        paymentVaultType: existing.paymentVaultType,
+        schedule: existing.schedule,
+        nextPaymentTimestamp: resumeAt
+      )
+
+      let priority = FlowCallbackScheduler.Priority.Medium
+      let executionEffort: UInt64 = 1000
+      let estimate = FlowCallbackScheduler.estimate(
+        data: resumeConfig,
+        timestamp: resumeAt,
+        priority: priority,
+        executionEffort: executionEffort
+      )
+      assert(
+        estimate.timestamp != nil || priority == FlowCallbackScheduler.Priority.Low,
+        message: estimate.error ?? "estimation failed"
+      )
+
+      let withdrawCap = self.flowWithdrawCap ?? panic("flow withdraw capability not set on agent")
+      let vaultRef = withdrawCap.borrow() ?? panic("invalid flow withdraw capability")
+      let fees <- vaultRef.withdraw(amount: estimate.flowFee ?? 0.0) as! @FlowToken.Vault
+
+      let handlerCap = self.handlerCap ?? panic("handler capability not set on agent")
+      let receipt = FlowCallbackScheduler.schedule(
+        callback: handlerCap,
+        data: resumeConfig,
+        timestamp: resumeAt,
+        priority: priority,
+        executionEffort: executionEffort,
+        fees: <-fees
+      )
+      emit CallbackScheduled(id: self.agentId, at: receipt.timestamp)
     }
 
     access(all) fun cancel() {
       pre {
         Cascade.agentDetailsById[self.agentId] != nil: "Agent not registered"
       }
-      Cascade.setAgentStatus(id: self.agentId, status: Status.Canceled)
+      let existing = Cascade.agentDetailsById[self.agentId] ?? panic("Agent not registered")
+      Cascade.agentDetailsById[self.agentId] = AgentDetails(
+        id: existing.id,
+        owner: existing.owner,
+        organization: existing.organization,
+        status: Status.Canceled,
+        paymentAmount: existing.paymentAmount,
+        paymentVaultType: existing.paymentVaultType,
+        schedule: existing.schedule,
+        nextPaymentTimestamp: 0.0,
+        action: existing.action
+      )
+      emit AgentStatusChanged(id: self.agentId, status: Status.Canceled.rawValue)
     }
 
-    access(all) fun updatePaymentDetails(newAmount: UFix64?, newSchedule: String?) {
+    access(all) fun updatePaymentAmount(newAmount: UFix64) {
       pre {
         Cascade.agentDetailsById[self.agentId] != nil: "Agent not registered"
       }
-      panic("stub")
+      let existing = Cascade.agentDetailsById[self.agentId] ?? panic("Agent not registered")
+      Cascade.agentDetailsById[self.agentId] = AgentDetails(
+        id: existing.id,
+        owner: existing.owner,
+        organization: existing.organization,
+        status: existing.status,
+        paymentAmount: newAmount,
+        paymentVaultType: existing.paymentVaultType,
+        schedule: existing.schedule,
+        nextPaymentTimestamp: existing.nextPaymentTimestamp,
+        action: existing.action
+      )
+      emit AgentUpdated(id: self.agentId)
     }
+
+    access(all) fun updateOrganization(newOrganization: String) {
+      pre {
+        Cascade.agentDetailsById[self.agentId] != nil: "Agent not registered"
+      }
+      // Ensure the organization is verified and has a recipient address
+      assert(Cascade.verifiedOrganizations.contains(newOrganization), message: "organization not verified")
+      assert(Cascade.organizationAddressByName[newOrganization] != nil, message: "organization recipient not set")
+
+      let existing = Cascade.agentDetailsById[self.agentId] ?? panic("Agent not registered")
+
+      // Update organization index
+      let oldOrg = existing.organization
+      if Cascade.agentsByOrganization[oldOrg] != nil {
+        let idx = Cascade.agentsByOrganization[oldOrg]!.agentIds
+        var filtered: [UInt64] = []
+        for v in idx {
+          if v != self.agentId {
+            filtered.append(v)
+          }
+        }
+        Cascade.agentsByOrganization[oldOrg] = OrganizationIndex(organization: oldOrg, agentIds: filtered)
+      }
+      if Cascade.agentsByOrganization[newOrganization] == nil {
+        Cascade.agentsByOrganization[newOrganization] = OrganizationIndex(organization: newOrganization, agentIds: [])
+      }
+      Cascade.agentsByOrganization[newOrganization]!.agentIds.append(self.agentId)
+
+      // Persist update
+      Cascade.agentDetailsById[self.agentId] = AgentDetails(
+        id: existing.id,
+        owner: existing.owner,
+        organization: newOrganization,
+        status: existing.status,
+        paymentAmount: existing.paymentAmount,
+        paymentVaultType: existing.paymentVaultType,
+        schedule: existing.schedule,
+        nextPaymentTimestamp: existing.nextPaymentTimestamp,
+        action: existing.action
+      )
+      emit AgentUpdated(id: self.agentId)
+    }
+
+    access(all) fun setLastCallback(receipt: FlowCallbackScheduler.ScheduledCallback) {
+      self.lastCallback = receipt
+    }
+
+    access(all) fun setActive() {
+      pre {
+        Cascade.agentDetailsById[self.agentId] != nil: "Agent not registered"
+      }
+      let existing = Cascade.agentDetailsById[self.agentId] ?? panic("Agent not registered")
+      Cascade.agentDetailsById[self.agentId] = AgentDetails(
+        id: existing.id,
+        owner: existing.owner,
+        organization: existing.organization,
+        status: Status.Active,
+        paymentAmount: existing.paymentAmount,
+        paymentVaultType: existing.paymentVaultType,
+        schedule: existing.schedule,
+        nextPaymentTimestamp: existing.nextPaymentTimestamp,
+        action: existing.action
+      )
+      emit AgentStatusChanged(id: self.agentId, status: Status.Active.rawValue)
+    }
+
+    access(all) fun updateSchedule(newScheduleName: String, rescheduleAt: UFix64?) {
+      pre {
+        Cascade.agentDetailsById[self.agentId] != nil: "Agent not registered"
+      }
+      let existing = Cascade.agentDetailsById[self.agentId] ?? panic("Agent not registered")
+
+      // Cancel pending callback if exists and refund
+      if self.lastCallback != nil {
+        let refund <- FlowCallbackScheduler.cancel(callback: self.lastCallback!)
+        // deposit refund back to owner
+        let ownerAcct = getAccount(existing.owner)
+        let ownerReceiver = ownerAcct.capabilities.borrow<&{FungibleToken.Receiver}>(/public/flowTokenReceiver)
+          ?? panic("owner missing FlowToken receiver")
+        ownerReceiver.deposit(from: <-refund)
+        self.lastCallback = nil
+      }
+
+      let newSchedule = Cascade.parseSchedule(name: newScheduleName)
+      let nowTs = getCurrentBlock().timestamp
+      let resumeAt = rescheduleAt != nil ? rescheduleAt! : (existing.nextPaymentTimestamp > nowTs ? existing.nextPaymentTimestamp : nowTs + 1.0)
+
+      // Persist schedule change and new next timestamp
+      Cascade.agentDetailsById[self.agentId] = AgentDetails(
+        id: existing.id,
+        owner: existing.owner,
+        organization: existing.organization,
+        status: Status.Active,
+        paymentAmount: existing.paymentAmount,
+        paymentVaultType: existing.paymentVaultType,
+        schedule: newSchedule,
+        nextPaymentTimestamp: resumeAt,
+        action: existing.action
+      )
+
+      // Build new cron config and schedule
+      let cronConfig = AgentCronConfig(
+        intervalSeconds: Cascade.getIntervalSeconds(schedule: newSchedule),
+        baseTimestamp: nowTs,
+        maxExecutions: nil,
+        executionCount: 0,
+        action: nil,
+        organization: existing.organization,
+        paymentAmount: existing.paymentAmount,
+        paymentVaultType: existing.paymentVaultType,
+        schedule: newSchedule,
+        nextPaymentTimestamp: resumeAt
+      )
+
+      let priority = FlowCallbackScheduler.Priority.Medium
+      let executionEffort: UInt64 = 1000
+      let estimate = FlowCallbackScheduler.estimate(
+        data: cronConfig,
+        timestamp: resumeAt,
+        priority: priority,
+        executionEffort: executionEffort
+      )
+      assert(estimate.timestamp != nil || priority == FlowCallbackScheduler.Priority.Low, message: estimate.error ?? "estimation failed")
+
+      let withdrawCap = self.flowWithdrawCap ?? panic("flow withdraw capability not set on agent")
+      let vaultRef = withdrawCap.borrow() ?? panic("invalid flow withdraw capability")
+      let fees <- vaultRef.withdraw(amount: estimate.flowFee ?? 0.0) as! @FlowToken.Vault
+
+      let handlerCap = self.handlerCap ?? panic("handler capability not set on agent")
+      let receipt = FlowCallbackScheduler.schedule(
+        callback: handlerCap,
+        data: cronConfig,
+        timestamp: resumeAt,
+        priority: priority,
+        executionEffort: executionEffort,
+        fees: <-fees
+      )
+      self.lastCallback = receipt
+      emit CallbackScheduled(id: self.agentId, at: receipt.timestamp)
+      emit AgentUpdated(id: self.agentId)
+    }
+
+    
 
     access(contract) fun registerAgent(
       owner: Address,
@@ -352,7 +588,8 @@ access(all) contract Cascade {
         paymentAmount: paymentAmount,
         paymentVaultType: paymentVaultType,
         schedule: schedule,
-        nextPaymentTimestamp: nextPaymentTimestamp
+        nextPaymentTimestamp: nextPaymentTimestamp,
+        action: Action.Send
       )
 
       if Cascade.agentsByOwner[owner] == nil {
@@ -407,7 +644,8 @@ access(all) contract Cascade {
       paymentAmount: existing.paymentAmount,
       paymentVaultType: existing.paymentVaultType,
       schedule: existing.schedule,
-      nextPaymentTimestamp: existing.nextPaymentTimestamp
+      nextPaymentTimestamp: existing.nextPaymentTimestamp,
+      action: existing.action
     )
     emit AgentStatusChanged(id: id, status: status.rawValue)
   }
@@ -468,15 +706,12 @@ access(all) contract Cascade {
     let sched = Cascade.parseSchedule(name: name)
     let interval = Cascade.getIntervalSeconds(schedule: sched)
     let now = getCurrentBlock().timestamp
-    var action: String? = nil
-    if name == "pause" || name == "Pause" { action = "pause" }
-    if name == "cancel" || name == "Cancel" { action = "cancel" }
     return AgentCronConfig(
       intervalSeconds: interval,
       baseTimestamp: now,
       maxExecutions: maxExecutions,
       executionCount: 0,
-      action: action,
+      action: nil,
       organization: organization,
       paymentAmount: paymentAmount,
       paymentVaultType: paymentVaultType,

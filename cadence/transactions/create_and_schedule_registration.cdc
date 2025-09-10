@@ -27,10 +27,6 @@ transaction(
       sched = Cascade.Schedule.Yearly
     } else if scheduleName == "10s" || scheduleName == "TenSeconds" {
       sched = Cascade.Schedule.TenSeconds
-    } else if scheduleName == "pause" || scheduleName == "Pause" {
-      sched = Cascade.Schedule.OneTime
-    } else if scheduleName == "cancel" || scheduleName == "Cancel" {
-      sched = Cascade.Schedule.OneTime
     } else if scheduleName == "onetime" || scheduleName == "OneTime" || scheduleName == "one-time" || scheduleName == "one_time" || scheduleName == "once" || scheduleName == "Once" {
       sched = Cascade.Schedule.OneTime
     } else {
@@ -111,6 +107,9 @@ transaction(
       executionEffort: executionEffort,
       fees: <-fees
     )
+
+    // Persist receipt on the agent for future cancel/reschedule operations
+    agentRef.setLastCallback(receipt: _receipt)
   }
 }
 
