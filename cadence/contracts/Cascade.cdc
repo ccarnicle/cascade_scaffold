@@ -201,7 +201,7 @@ access(all) contract Cascade {
         if Cascade.agentDetailsById[self.agentId] == nil { //if the agent is not registered, register it
           let reg = data as? AgentCronConfig //get the registration data
           if reg != nil {
-            self.registerAgent( //register the agent
+            self.registerAgent( //register agent - Agent is set to "active" upon registration
               owner: self.owner?.address ?? panic("Owner not found"),
               organization: reg!.organization,
               paymentAmount: reg!.paymentAmount,
@@ -566,8 +566,6 @@ access(all) contract Cascade {
       emit AgentUpdated(id: self.agentId)
     }
 
-    
-
     access(contract) fun registerAgent(
       owner: Address,
       organization: String,
@@ -584,7 +582,7 @@ access(all) contract Cascade {
         id: self.agentId,
         owner: owner,
         organization: organization,
-        status: Status.Canceled, //set to canceled until the first callback is executed
+        status: Status.Active, // agent starts Active upon registration (contract-controlled)
         paymentAmount: paymentAmount,
         paymentVaultType: paymentVaultType,
         schedule: schedule,

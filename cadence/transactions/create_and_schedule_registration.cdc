@@ -59,14 +59,18 @@ transaction(
       ?? panic("agent not found after save")
     agentRef.setCapabilities(handlerCap: agentCap, flowWithdrawCap: flowCap)
 
-    // Build cron configuration payload in-contract (standardized intervals)
-    let cronConfig: Cascade.AgentCronConfig = Cascade.buildCronConfigFromName(
-      name: scheduleName,
+    // Build cron configuration payload and explicitly set action for first run
+    let cronConfig: Cascade.AgentCronConfig = Cascade.AgentCronConfig(
+      intervalSeconds: Cascade.getIntervalSeconds(schedule: sched),
+      baseTimestamp: getCurrentBlock().timestamp,
+      maxExecutions: maxExecutions,
+      executionCount: 0,
+      action: "Send",
       organization: organization,
       paymentAmount: paymentAmount,
       paymentVaultType: vaultType,
-      nextPaymentTimestamp: nextPaymentTimestamp,
-      maxExecutions: maxExecutions
+      schedule: sched,
+      nextPaymentTimestamp: nextPaymentTimestamp
     )
 
     // Compute first execution time: as-soon-as-possible (next block)
