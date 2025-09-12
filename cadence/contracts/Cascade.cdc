@@ -174,17 +174,24 @@ access(all) contract Cascade {
   access(all) resource Agent: FlowCallbackScheduler.CallbackHandler {
     //All Agent metadata is stored in the AgentDetails struct
     access(all) let agentId: UInt64
+    access(all) let name: String
+    access(all) let description: String
     access(contract) var handlerCap: Capability<auth(FlowCallbackScheduler.Execute) &{FlowCallbackScheduler.CallbackHandler}>?
     access(contract) var flowWithdrawCap: Capability<auth(FungibleToken.Withdraw) &FlowToken.Vault>?
-    access(contract) var lastCallback: FlowCallbackScheduler.ScheduledCallback?
+    access(contract) var lastCallback: @FlowCallbackScheduler.ScheduledCallback?
 
     init(
-      id: UInt64
+      name: String,
+      description: String
     ) {
-      self.agentId = id
+      let newId: UInt64 = Cascade.nextAgentId
+      self.agentId = newId
+      Cascade.nextAgentId = newId + 1
       self.handlerCap = nil
       self.flowWithdrawCap = nil
-      self.lastCallback = nil
+      self.lastCallback <- nil
+      self.name = name
+      self.description = description
     }
 
     access(all) fun setCapabilities(
@@ -304,7 +311,7 @@ access(all) contract Cascade {
 
         // Use stored handler capability to schedule the next callback
         let handlerCap = self.handlerCap ?? panic("handler capability not set on agent")
-        let receipt = FlowCallbackScheduler.schedule(
+        let receipt <- FlowCallbackScheduler.schedule(
             callback: handlerCap,
             data: updatedConfig,
             timestamp: nextExecutionTime,
@@ -314,7 +321,7 @@ access(all) contract Cascade {
         )
 
         emit CallbackScheduled(id: self.agentId, at: receipt.timestamp)
-        self.lastCallback = receipt
+        self.lastCallback <-! receipt
       } else {
         panic("No data provided")
       }
@@ -376,7 +383,7 @@ access(all) contract Cascade {
       let fees <- vaultRef.withdraw(amount: estimate.flowFee ?? 0.0) as! @FlowToken.Vault
 
       let handlerCap = self.handlerCap ?? panic("handler capability not set on agent")
-      let receipt = FlowCallbackScheduler.schedule(
+      let receipt <- FlowCallbackScheduler.schedule(
         callback: handlerCap,
         data: resumeConfig,
         timestamp: resumeAt,
@@ -385,6 +392,8 @@ access(all) contract Cascade {
         fees: <-fees
       )
       emit CallbackScheduled(id: self.agentId, at: receipt.timestamp)
+      self.lastCallback <-! receipt
+
     }
 
     access(all) fun cancel() {
@@ -467,8 +476,8 @@ access(all) contract Cascade {
       emit AgentUpdated(id: self.agentId)
     }
 
-    access(all) fun setLastCallback(receipt: FlowCallbackScheduler.ScheduledCallback) {
-      self.lastCallback = receipt
+    access(all) fun setLastCallback(receipt: @FlowCallbackScheduler.ScheduledCallback) {
+      self.lastCallback <-! receipt
     }
 
     access(all) fun setActive() {
@@ -498,13 +507,13 @@ access(all) contract Cascade {
 
       // Cancel pending callback if exists and refund
       if self.lastCallback != nil {
-        let refund <- FlowCallbackScheduler.cancel(callback: self.lastCallback!)
+        let callback <- self.lastCallback <-! nil
+        let refund <- FlowCallbackScheduler.cancel(callback: <-callback!)
         // deposit refund back to owner
         let ownerAcct = getAccount(existing.owner)
         let ownerReceiver = ownerAcct.capabilities.borrow<&{FungibleToken.Receiver}>(/public/flowTokenReceiver)
           ?? panic("owner missing FlowToken receiver")
         ownerReceiver.deposit(from: <-refund)
-        self.lastCallback = nil
       }
 
       let newSchedule = Cascade.parseSchedule(name: newScheduleName)
@@ -553,7 +562,7 @@ access(all) contract Cascade {
       let fees <- vaultRef.withdraw(amount: estimate.flowFee ?? 0.0) as! @FlowToken.Vault
 
       let handlerCap = self.handlerCap ?? panic("handler capability not set on agent")
-      let receipt = FlowCallbackScheduler.schedule(
+      let receipt <- FlowCallbackScheduler.schedule(
         callback: handlerCap,
         data: cronConfig,
         timestamp: resumeAt,
@@ -561,8 +570,8 @@ access(all) contract Cascade {
         executionEffort: executionEffort,
         fees: <-fees
       )
-      self.lastCallback = receipt
       emit CallbackScheduled(id: self.agentId, at: receipt.timestamp)
+      self.lastCallback <-! receipt
       emit AgentUpdated(id: self.agentId)
     }
 
@@ -603,8 +612,6 @@ access(all) contract Cascade {
       Cascade.agentsByOrganization[organization]!.agentIds.append(self.agentId)
 
       emit AgentCreated(id: self.agentId, owner: owner)
-
-      Cascade.nextAgentId = self.agentId + 1
     }
   }
 
@@ -621,15 +628,10 @@ access(all) contract Cascade {
     }
   }
 
-  access(all) fun createAgent(
-    id: UInt64,
-    paymentAmount: UFix64,
-    paymentVaultType: Type,
-    organization: String,
-    schedule: Schedule,
-    nextPaymentTimestamp: UFix64
-  ): @Agent {
-    return <-create Agent(id: id)
+  access(all) fun createAgent(): @Agent {
+    let id = Cascade.nextAgentId
+    let name = "cascade_".concat(id.toString())
+    return <-create Agent(name: name, description: "Flow Agent automation handler")
   }
 
   access(contract) fun setAgentStatus(id: UInt64, status: Status) {

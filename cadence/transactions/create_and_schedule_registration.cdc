@@ -35,14 +35,7 @@ transaction(
 
     // Create and save the Agent
     let vaultType: Type = Type<@FlowToken.Vault>()
-    let agent <- Cascade.createAgent(
-      id: id,
-      paymentAmount: paymentAmount,
-      paymentVaultType: vaultType,
-      organization: organization,
-      schedule: sched,
-      nextPaymentTimestamp: nextPaymentTimestamp
-    )
+    let agent <- Cascade.createAgent()
 
     // Save the Agent at its per-id path
     let storagePath = Cascade.getAgentStoragePath(id: id)
@@ -103,7 +96,7 @@ transaction(
     let fees <- vaultRef.withdraw(amount: est.flowFee ?? 0.0) as! @FlowToken.Vault
 
     // Schedule the first callback using the handler capability
-    let _receipt = FlowCallbackScheduler.schedule(
+    let _receipt <- FlowCallbackScheduler.schedule(
       callback: agentCap,
       data: cronConfig,
       timestamp: firstExecutionTime,
@@ -113,7 +106,7 @@ transaction(
     )
 
     // Persist receipt on the agent for future cancel/reschedule operations
-    agentRef.setLastCallback(receipt: _receipt)
+    agentRef.setLastCallback(receipt: <- _receipt)
   }
 }
 
